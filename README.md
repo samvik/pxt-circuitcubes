@@ -3,9 +3,9 @@
 MakeCode extension that lets a **micro:bit v2** control a **Circuit Cubes Bluetooth
 Battery Cube** directly: the micro:bit is the BLE *Central*, no phone or PC needed.
 
-> **Status: compiles and links for micro:bit v2 (CODAL); not yet tested on real hardware.**
-> The radio timing code (T_IFS, connection events) is written from the spec and
-> needs bring-up against a real cube. See *Known limitations*.
+> **Status:** works with one Circuit Cube (`Tenka…`) on one micro:bit v2: connects, stays connected
+> (~1 % of connection events missed) and drives motors. Other cubes/boards are untested, and only one
+> cube can be connected at a time.
 
 ## Blocks
 
@@ -51,11 +51,22 @@ basic.forever(function () {
   CODAL already defines `RADIO_IRQHandler` for its own radio driver, so the ISRs are installed with
   `NVIC_SetVector` instead of overriding that symbol.
 
+## Incompatible extensions
+
+This extension owns the radio, so it must not be combined with `radio` or `bluetooth`.
+MakeCode has no "conflicts" field in `pxt.json`; the only conflict check it performs is on
+build settings. `radio` sets `microbit-dal.bluetooth.enabled = 0` and `bluetooth` sets it to `1`,
+so `pxt.json` here declares the otherwise unused value `2`. Adding this extension to a project that
+has `radio`/`bluetooth` (or the reverse) then triggers MakeCode's "extension conflict" dialog, which
+offers to remove the conflicting extension. The setting itself has no effect on the build.
+Other extensions that use the radio but set no such value cannot be detected this way.
+
 ## Known limitations
 
-* Untested on hardware. Likeliest tuning points are the constants `TX_RAMP_US` (CONNECT_IND and
-  anchor timing) and `PREP_LEAD_US` at the top of `circuitcubes.cpp`.
-* The name must be in the `ADV_IND`; a name only present in a scan response is not matched.
+* One cube at a time. Timing constants to tune if another cube/board misbehaves: `TX_RAMP_US`,
+  `PREP_LEAD_US`, `SCAN_REQ_ADJ_US` and `CONNECT_IND_ADJ_US` at the top of `circuitcubes.cpp`.
+* Cubes put their name in the scan response, so the scanner is *active* (it sends SCAN_REQ to every
+  connectable advertiser nearby).
 * No encryption/pairing, no MTU exchange (default 23), no notifications (RX characteristic unused),
   one packet pair per connection event.
 * Zero speed is sent as `+000x` (5 bytes). Set `CC_SIGNED_STOP 0` for the 4-byte `000x` form.

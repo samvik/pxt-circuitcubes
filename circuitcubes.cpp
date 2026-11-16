@@ -88,6 +88,11 @@ static volatile uint32_t stat[12];   // 10 = SCAN_REQ sent
 static char    last_name[2][32];          // [0] from ADV_IND, [1] from SCAN_RSP
 static uint8_t last_name_len[2];
 
+// T_IFS tuning (us, added to "END + 150 us - radio ramp-up"), measured against Circuit Cubes:
+// SCAN_REQ was answered at -22..-16 us, CONNECT_IND accepted at 0..-16 us.
+static const int SCAN_REQ_ADJ_US = -19;
+static const int CONNECT_IND_ADJ_US = -8;
+
 // active scanning
 static uint8_t target_addr[6];
 static bool    have_target;
@@ -134,9 +139,13 @@ static volatile uint8_t g_dirty;
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
+// TIMER0 has only 4 CC registers (CC[4]/CC[5] exist on TIMER3/4 only). CC0 doubles as the
+// "now" scratch register: it is only armed (PPI -> TXEN) for the <150 us between
+// schedule_tx()/conn_prepare() and the start of the transmission, and tnow() is never
+// called inside that window.
 static inline uint32_t tnow() {
-    T->TASKS_CAPTURE[4] = 1;
-    return T->CC[4];
+    T->TASKS_CAPTURE[0] = 1;
+    return T->CC[0];
 }
 static inline bool in_future(uint32_t t, uint32_t margin_us) {
     return (int32_t)(t - tnow()) > (int32_t)margin_us;
@@ -356,9 +365,19 @@ static void remember_name(const uint8_t *ad, uint8_t n, int kind) {
     last_name_len[kind] = nl;
 }
 
-// Transmit txdma T_IFS after the packet that ended at tend (timer us). Returns false if too late.
-static bool schedule_tx(uint32_t tend, uint32_t shorts, bool then_rx) {
-    uint32_t at = tend + 150 - TX_RAMP_US;
+// After a TX with DISABLED->RXEN armed: wait until the radio really entered RX, so that
+// dropping that short afterwards cannot race with it.
+static void wait_rx_started() {
+    for (volatile int i = 0; i < 300; i++) {
+        uint32_t st = R->STATE & 0xF;
+        if (st >= 1 && st <= 3) return;     // RXRU / RXIDLE / RX
+    }
+}
+
+// Transmit txdma T_IFS (+adj us) after the packet that ended at tend (timer us).
+// Returns false if too late.
+static bool schedule_tx(uint32_t tend, uint32_t shorts, bool then_rx, int adj) {
+    uint32_t at = (uint32_t)((int32_t)tend + 150 - (int32_t)TX_RAMP_US + adj);
     if (!in_future(at, 8)) return false;
     R->PACKETPTR = (uint32_t)txdma;
     R->SHORTS = shorts;
@@ -402,7 +421,7 @@ static void scan_rx_end() {
         if (match && type == 0) {
             stat[5]++;
             build_connect_ind(rxbuf);
-            if (schedule_tx(tend, RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk, false)) {
+            if (schedule_tx(tend, RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk, false, CONNECT_IND_ADJ_US)) {
                 stat[6]++;
                 T->INTENCLR = TIMER_INTENCLR_COMPARE1_Msk;
                 g_state = ST_INIT_TX;
@@ -412,7 +431,8 @@ static void scan_rx_end() {
             // name may be in the scan response: ask for it (active scan, like a phone does)
             stat[10]++;
             build_scan_req(rxbuf);
-            if (schedule_tx(tend, RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk, true)) {
+            if (schedule_tx(tend, RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk, true,
+                            SCAN_REQ_ADJ_US)) {
                 g_state = ST_SCAN_REQ;
                 return;
             }
@@ -424,8 +444,9 @@ static void scan_rx_end() {
 static void scan_req_tx_end() {
     uint32_t tend = T->CC[2];
     tx_trigger_off();
-    R->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk;   // no more RXEN
     R->PACKETPTR = (uint32_t)rxbuf;
+    wait_rx_started();
+    R->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk;   // no more RXEN
     clr(&R->EVENTS_ADDRESS);
     clr(&R->EVENTS_END);
     rsp_end = false;
@@ -712,8 +733,9 @@ static void conn_prepare() {
 static void conn_tx_end() {
     uint32_t tend = T->CC[2];
     tx_trigger_off();
-    R->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk;   // no more RXEN
     R->PACKETPTR = (uint32_t)rxbuf;
+    wait_rx_started();
+    R->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk;   // no more RXEN
     clr(&R->EVENTS_ADDRESS);
     clr(&R->EVENTS_END);
     g_phase = PH_RX;
@@ -795,7 +817,7 @@ static void cc_timer_isr(void) {
         if (g_state == ST_CONN) {
             conn_prepare();
         } else {
-            T->CC[1] = tnow() + SCAN_DWELL_US;
+            T->CC[1] += SCAN_DWELL_US;      // no tnow(): CC0 may be armed for a TX right now
             if (g_state == ST_SCAN) {
                 scan_rot = true;
                 R->TASKS_DISABLE = 1;
