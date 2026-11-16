@@ -20,7 +20,10 @@ circuitCubes.stopAll()
 | --- | --- |
 | `connect to Circuit Cube` | Starts scanning for a device named `Tenka` or `Circuit Cube`, connects, discovers the Nordic UART write characteristic. Reconnects automatically after a dropped link. |
 | `Circuit Cube is connected` | `true` once linked **and** the write characteristic was found. |
+| `wait until Circuit Cube is connected (max N ms)` | Pauses the program until connected; `0` (default) waits forever. |
+| `disconnect Circuit Cube` | Closes the link (LL terminate) and stops scanning/auto-reconnect until `connect` is called again. |
 | `set motor A/B/C to speed n` | Clamps to -255..255, sends `[+/-]NNN[a/b/c]`. Ignored while not connected. |
+| `run motor A/B/C at speed n for N ms` | Runs the motor, waits, then stops it. |
 | `stop all motors` | Sets all three ports to 0. |
 
 Typical program:

@@ -40,6 +40,16 @@ namespace circuitCubes {
         // simulator: nothing to drive
     }
 
+    //% shim=circuitcubes::setNameFilter
+    function nativeSetNameFilter(name: string): void {
+        // simulator: nothing to filter
+    }
+
+    //% shim=circuitcubes::disconnect
+    function nativeDisconnect(): void {
+        simConnected = false;
+    }
+
     //% shim=circuitcubes::stopAll
     function nativeStopAll(): void {
         // simulator: nothing to drive
@@ -56,7 +66,7 @@ namespace circuitCubes {
         return 0;
     }
 
-    /** Last device name heard: kind 0 = advertisement, 1 = scan response */
+    /** Names: kind 0 = last advertisement, 1 = last scan response, 2 = the cube that was matched, 3 = last motor command written */
     //% shim=circuitcubes::debugName blockHidden=true
     export function debugName(kind: number): string {
         return "";
@@ -72,6 +82,21 @@ namespace circuitCubes {
     //% blockId=circuitcubes_connect block="connect to Circuit Cube"
     //% weight=100
     export function connect(): void {
+        nativeSetNameFilter("");
+        nativeConnect();
+    }
+
+    /**
+     * Connect to a specific Circuit Cube. The cube's Bluetooth name starts with "Tenka"
+     * followed by a number; give any part of it, eg: "4130". Use this when more than one
+     * cube is switched on. The name is printed in the diagnostics (see README).
+     * @param name part of the cube's name, eg: 4130
+     */
+    //% blockId=circuitcubes_connectnamed block="connect to Circuit Cube named %name"
+    //% name.defl="4130"
+    //% weight=99
+    export function connectToNamed(name: string): void {
+        nativeSetNameFilter(name);
         nativeConnect();
     }
 
@@ -82,6 +107,31 @@ namespace circuitCubes {
     //% weight=90
     export function isConnected(): boolean {
         return nativeIsConnected();
+    }
+
+    /**
+     * Wait until a Circuit Cube is connected.
+     * @param timeoutMs give up after this many milliseconds, 0 waits forever, eg: 0
+     */
+    //% blockId=circuitcubes_waitconnected block="wait until Circuit Cube is connected || max %timeoutMs ms"
+    //% timeoutMs.min=0 timeoutMs.defl=0
+    //% weight=95
+    export function waitUntilConnected(timeoutMs: number = 0): void {
+        const start = control.millis();
+        while (!nativeIsConnected()) {
+            if (timeoutMs > 0 && control.millis() - start >= timeoutMs) return;
+            basic.pause(20);
+        }
+    }
+
+    /**
+     * Close the connection to the cube and stop scanning.
+     * Call "connect to Circuit Cube" to connect again.
+     */
+    //% blockId=circuitcubes_disconnect block="disconnect Circuit Cube"
+    //% weight=85
+    export function disconnect(): void {
+        nativeDisconnect();
     }
 
     /**
@@ -98,6 +148,21 @@ namespace circuitCubes {
         if (speed > 255) speed = 255;
         if (speed < -255) speed = -255;
         nativeSetMotor(port, speed);
+    }
+
+    /**
+     * Run a motor for some time, then stop it.
+     * @param port which motor port, eg: CubePort.A
+     * @param speed -255 to 255, eg: 255
+     * @param ms how long to run in milliseconds, eg: 1000
+     */
+    //% blockId=circuitcubes_runfor block="run motor %port at speed %speed for %ms ms"
+    //% speed.min=-255 speed.max=255 speed.defl=255 ms.min=0 ms.defl=1000
+    //% weight=75
+    export function runMotorFor(port: CubePort, speed: number, ms: number): void {
+        setMotor(port, speed);
+        basic.pause(ms);
+        setMotor(port, 0);
     }
 
     /**

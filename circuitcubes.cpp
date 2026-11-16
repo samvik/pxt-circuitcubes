@@ -84,9 +84,13 @@ static uint32_t rng_state;
 
 // debug counters (see debugStat): 1 adv rx ok, 2 adv crc bad, 3 ADV_IND, 4 SCAN_RSP,
 // 5 name match, 6 CONNECT_IND sent, 7 conn events answered, 8 conn events missed, 9 disconnects
-static volatile uint32_t stat[12];   // 10 = SCAN_REQ sent
-static char    last_name[2][32];          // [0] from ADV_IND, [1] from SCAN_RSP
-static uint8_t last_name_len[2];
+static volatile uint32_t stat[20];   // 18/19: setMotor calls / accepted   // 10 = SCAN_REQ sent
+// ATT diagnostics: 11 writes sent, 12 write handle, 13 char properties, 14 last ATT opcode received,
+// 15 last ATT error code, 16 opcode that error answered, 17 ATT notifications received
+static char    last_write[24];
+static uint8_t last_write_len;
+static char    last_name[3][32];          // [0] from ADV_IND, [1] from SCAN_RSP, [2] the cube we matched
+static uint8_t last_name_len[3];
 
 // T_IFS tuning (us, added to "END + 150 us - radio ramp-up"), measured against Circuit Cubes:
 // SCAN_REQ was answered at -22..-16 us, CONNECT_IND accepted at 0..-16 us.
@@ -127,6 +131,8 @@ static uint8_t  ctrl_len;
 static uint8_t  att_req[8];
 static uint8_t  att_req_len;
 static bool     att_inflight;
+static uint8_t  att_rsp[8];         // reply to a request the peer sent us (we are an ATT server for it)
+static uint8_t  att_rsp_len;
 static uint16_t gatt_handle;        // NUS write characteristic value handle
 static uint8_t  gatt_props;
 static bool     att_wait_rsp;
@@ -297,6 +303,18 @@ static void scan_start() {
     R->TASKS_RXEN = 1;
 }
 
+// Optional extra filter: the advertised name must contain this text (e.g. "4130").
+static char name_filter[16];
+static volatile uint8_t name_filter_len;
+
+static bool name_contains_filter(const uint8_t *d, uint8_t dl) {
+    uint8_t fl = name_filter_len;
+    if (fl == 0) return true;
+    for (uint8_t i = 0; i + fl <= dl; i++)
+        if (memcmp(d + i, name_filter, fl) == 0) return true;
+    return false;
+}
+
 static bool name_matches(const uint8_t *ad, uint8_t n) {
     static const char *names[2] = { "Tenka", "Circuit Cube" };
     uint8_t i = 0;
@@ -309,9 +327,10 @@ static bool name_matches(const uint8_t *ad, uint8_t n) {
         if (type == 0x08 || type == 0x09) {
             for (int k = 0; k < 2; k++) {
                 uint8_t tl = strlen(names[k]);
-                if (dl >= tl && memcmp(d, names[k], tl) == 0) return true;
-                // shortened name: advertised text is a prefix of the target
-                if (type == 0x08 && dl >= 3 && dl < tl && memcmp(d, names[k], dl) == 0) return true;
+                if (dl >= tl && memcmp(d, names[k], tl) == 0 && name_contains_filter(d, dl)) return true;
+                // shortened name: advertised text is a prefix of the target (cannot satisfy a filter)
+                if (type == 0x08 && dl >= 3 && dl < tl && memcmp(d, names[k], dl) == 0 &&
+                    name_filter_len == 0) return true;
             }
         }
         i += l + 1;
@@ -416,8 +435,9 @@ static void scan_rx_end() {
         const uint8_t *adva = &rxbuf[2];
         if (type == 0) stat[3]++;
         remember_name(&rxbuf[8], len - 6, 0);
-        bool match = name_matches(&rxbuf[8], len - 6) ||
-                     (have_target && memcmp(adva, target_addr, 6) == 0);
+        bool by_name = name_matches(&rxbuf[8], len - 6);
+        if (by_name) remember_name(&rxbuf[8], len - 6, 2);
+        bool match = by_name || (have_target && memcmp(adva, target_addr, 6) == 0);
         if (match && type == 0) {
             stat[5]++;
             build_connect_ind(rxbuf);
@@ -466,6 +486,7 @@ static void scan_rsp_end() {
     stat[4]++;
     remember_name(&rxbuf[8], len - 6, 1);
     if (name_matches(&rxbuf[8], len - 6)) {
+        remember_name(&rxbuf[8], len - 6, 2);
         memcpy(target_addr, cur_adva, 6);
         have_target = true;     // connect on its next ADV_IND
     }
@@ -482,9 +503,28 @@ static void resume_scan() {
 // ---------------------------------------------------------------------------
 // Connection (master side)
 // ---------------------------------------------------------------------------
+// user-requested disconnect (stays off until connect() is called again)
+static volatile bool g_off_req;
+static volatile bool g_reconnect;       // connect() called while a disconnect was still in progress
+static bool term_sent;
+
+static void enter_idle() {
+    radio_force_disable();
+    T->INTENCLR = TIMER_INTENCLR_COMPARE1_Msk | TIMER_INTENCLR_COMPARE3_Msk;
+    g_phase = PH_NONE;
+    g_ready = false;
+    g_state = ST_OFF;
+    if (g_reconnect) {
+        g_reconnect = false;
+        g_off_req = false;
+        scan_start();
+    }
+}
+
 static void go_scan() {
     stat[9]++;
-    scan_start();
+    if (g_off_req) enter_idle();
+    else scan_start();
 }
 
 static void att_queue(const uint8_t *p, uint8_t n) {
@@ -511,6 +551,8 @@ static void conn_begin() {
     ctrl_len = 0;
     disconnect_req = false;
     version_sent = false;
+    term_sent = false;
+    att_rsp_len = 0;
     att_wait_rsp = false;
     g_ready = false;
     gatt_handle = 0;
@@ -541,6 +583,11 @@ static void fetch_tx() {
         tx_llid = 3;
         tx_has = true;
         ctrl_len = 0;
+        return;
+    }
+    if (att_rsp_len) {
+        wrap_att(att_rsp, att_rsp_len);
+        att_rsp_len = 0;
         return;
     }
     if (att_req_len && !att_inflight) {
@@ -577,6 +624,9 @@ static void fetch_tx() {
             att[n++] = '0' + s % 10;
             att[n++] = 'a' + i;
         }
+        stat[11]++;
+        last_write_len = n - 3;
+        memcpy(last_write, att + 3, last_write_len);
         wrap_att(att, n);
         if (!no_rsp) {
             att_wait_rsp = true;
@@ -625,6 +675,9 @@ static void handle_ll_control(const uint8_t *d, uint8_t len) {
 
 static void att_rx(const uint8_t *p, uint8_t n) {
     if (n < 1) return;
+    stat[14] = p[0];
+    if (p[0] == 0x1B) stat[17]++;
+    if (p[0] == 0x01 && n >= 5) { stat[16] = p[1]; stat[15] = p[4]; }
     switch (p[0]) {
     case 0x09: {    // Read By Type Response
         if (n < 2) break;
@@ -636,6 +689,8 @@ static void att_rx(const uint8_t *p, uint8_t n) {
             if (il == 21 && memcmp(&p[i + 5], NUS_WRITE_UUID, 16) == 0) {
                 gatt_props = p[i + 2];
                 gatt_handle = p[i + 3] | (p[i + 4] << 8);
+                stat[12] = gatt_handle;
+                stat[13] = gatt_props;
                 g_ready = true;
                 return;
             }
@@ -654,6 +709,23 @@ static void att_rx(const uint8_t *p, uint8_t n) {
     case 0x13:      // Write Response
         att_wait_rsp = false;
         break;
+    case 0x02: {    // Exchange MTU Request from the peer: stay at the default MTU of 23
+        static const uint8_t r[3] = { 0x03, 23, 0 };
+        memcpy(att_rsp, r, 3);
+        att_rsp_len = 3;
+        break; }
+    case 0x1D: {    // Handle Value Indication: confirm
+        att_rsp[0] = 0x1E;
+        att_rsp_len = 1;
+        break; }
+    case 0x04: case 0x06: case 0x0A: case 0x0C: case 0x0E: case 0x10:
+    case 0x12: case 0x16: case 0x18: case 0x20: {   // requests we do not serve: Request Not Supported
+        att_rsp[0] = 0x01;
+        att_rsp[1] = p[0];
+        att_rsp[2] = 0; att_rsp[3] = 0;
+        att_rsp[4] = 0x06;
+        att_rsp_len = 5;
+        break; }
     default:
         break;      // notifications, etc.: ignored
     }
@@ -696,7 +768,8 @@ static void finish_event(bool got) {
     }
     if (!got) stat[8]++;
     uint32_t limit = established ? CONN_TIMEOUT_US : CONN_ESTABLISH_US;
-    if (disconnect_req || (int32_t)(now - last_rx) > (int32_t)limit) go_scan();
+    if (term_sent && !tx_has) enter_idle();     // terminate acknowledged: link closed
+    else if (disconnect_req || (int32_t)(now - last_rx) > (int32_t)limit) go_scan();
 }
 
 static void conn_prepare() {
@@ -711,6 +784,14 @@ static void conn_prepare() {
     set_channel(chan_unmapped);
 
     if (!tx_has) fetch_tx();
+    if (g_off_req && !tx_has && !term_sent) {   // LL_TERMINATE_IND, reason 0x13 (remote user terminated)
+        tx_payload[0] = 0x02;
+        tx_payload[1] = 0x13;
+        tx_len = 2;
+        tx_llid = 3;
+        tx_has = true;
+        term_sent = true;
+    }
     txdma[0] = (tx_has ? tx_llid : 1) | (rx_nesn << 2) | (tx_sn << 3);
     txdma[1] = tx_has ? tx_len : 0;
     if (tx_has) memcpy(&txdma[2], tx_payload, tx_len);
@@ -819,8 +900,12 @@ static void cc_timer_isr(void) {
         } else {
             T->CC[1] += SCAN_DWELL_US;      // no tnow(): CC0 may be armed for a TX right now
             if (g_state == ST_SCAN) {
-                scan_rot = true;
-                R->TASKS_DISABLE = 1;
+                if (g_off_req) {
+                    enter_idle();
+                } else {
+                    scan_rot = true;
+                    R->TASKS_DISABLE = 1;
+                }
             }
         }
     }
@@ -876,17 +961,41 @@ static void stack_init() {
 //%
 void startConnect() {
     if (!g_inited) stack_init();
+    if (g_off_req && g_state != ST_OFF) {
+        g_reconnect = true;         // restart as soon as the disconnect has finished
+        return;
+    }
+    g_off_req = false;
     if (g_state == ST_OFF) scan_start();
 }
 
 //%
+void setNameFilter(String name) {
+    name_filter_len = 0;
+    if (!name) return;
+    int n = name->getUTF8Size();
+    if (n > 15) n = 15;
+    memcpy(name_filter, name->getUTF8Data(), n);
+    name_filter_len = n;
+}
+
+//%
+void disconnect() {
+    if (!g_inited || g_state == ST_OFF) return;
+    g_reconnect = false;
+    g_off_req = true;
+}
+
+//%
 bool isConnected() {
-    return g_inited && g_state == ST_CONN && g_ready;
+    return g_inited && g_state == ST_CONN && g_ready && !g_off_req;
 }
 
 //%
 void setMotorRaw(int port, int speed) {
+    stat[18]++;
     if (port < 1 || port > 3 || !isConnected()) return;
+    stat[19]++;
     if (speed > 255) speed = 255;
     if (speed < -255) speed = -255;
     g_speed[port - 1] = speed;
@@ -896,13 +1005,19 @@ void setMotorRaw(int port, int speed) {
 //%
 int debugStat(int i) {
     if (i == 0) return g_state;
-    if (i < 1 || i > 10) return 0;
+    // live queue state: 20 dirty mask, 21 LL PDU waiting for ack, 22 ATT request in flight, 23 ATT reply queued
+    if (i == 20) return g_dirty;
+    if (i == 21) return tx_has;
+    if (i == 22) return att_inflight;
+    if (i == 23) return att_rsp_len;
+    if (i < 1 || i > 19) return 0;
     return (int)stat[i];
 }
 
 //%
 String debugName(int kind) {
-    if (kind < 0 || kind > 1) kind = 0;
+    if (kind == 3) return mkString(last_write, last_write_len);   // last motor command written
+    if (kind < 0 || kind > 2) kind = 0;
     return mkString(last_name[kind], last_name_len[kind]);
 }
 
