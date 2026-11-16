@@ -23,6 +23,7 @@ control.inBackground(function () {
             + " adv=" + circuitCubes.debugStat(1)
             + " bad=" + circuitCubes.debugStat(2)
             + " ind=" + circuitCubes.debugStat(3)
+            + " sreq=" + circuitCubes.debugStat(10)
             + " rsp=" + circuitCubes.debugStat(4)
             + " match=" + circuitCubes.debugStat(5)
             + " conn=" + circuitCubes.debugStat(6)

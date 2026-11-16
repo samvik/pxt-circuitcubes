@@ -84,7 +84,7 @@ static uint32_t rng_state;
 
 // debug counters (see debugStat): 1 adv rx ok, 2 adv crc bad, 3 ADV_IND, 4 SCAN_RSP,
 // 5 name match, 6 CONNECT_IND sent, 7 conn events answered, 8 conn events missed, 9 disconnects
-static volatile uint32_t stat[10];
+static volatile uint32_t stat[12];   // 10 = SCAN_REQ sent
 static char    last_name[2][32];          // [0] from ADV_IND, [1] from SCAN_RSP
 static uint8_t last_name_len[2];
 
@@ -92,8 +92,6 @@ static uint8_t last_name_len[2];
 static uint8_t target_addr[6];
 static bool    have_target;
 static uint8_t cur_adva[6];
-static uint8_t seen_addr[8][6];
-static uint8_t seen_count, seen_pos;
 static volatile bool rsp_end, rsp_to;
 
 // scanning
@@ -276,7 +274,6 @@ static void scan_start() {
     g_phase = PH_NONE;
     g_ready = false;
     have_target = false;
-    seen_count = seen_pos = 0;
     g_state = ST_SCAN;
     scan_idx = 0;
     scan_rot = false;
@@ -359,18 +356,6 @@ static void remember_name(const uint8_t *ad, uint8_t n, int kind) {
     last_name_len[kind] = nl;
 }
 
-// small ring of addresses we already sent a SCAN_REQ to
-static bool seen_addr_before(const uint8_t *a) {
-    for (uint8_t i = 0; i < seen_count; i++)
-        if (memcmp(seen_addr[i], a, 6) == 0) return true;
-    return false;
-}
-static void remember_addr(const uint8_t *a) {
-    memcpy(seen_addr[seen_pos], a, 6);
-    seen_pos = (seen_pos + 1) & 7;
-    if (seen_count < 8) seen_count++;
-}
-
 // Transmit txdma T_IFS after the packet that ended at tend (timer us). Returns false if too late.
 static bool schedule_tx(uint32_t tend, uint32_t shorts, bool then_rx) {
     uint32_t at = tend + 150 - TX_RAMP_US;
@@ -423,9 +408,9 @@ static void scan_rx_end() {
                 g_state = ST_INIT_TX;
                 return;
             }
-        } else if (!match && !seen_addr_before(adva)) {
-            // name may be in the scan response: ask for it (active scan)
-            remember_addr(adva);
+        } else if (!match) {
+            // name may be in the scan response: ask for it (active scan, like a phone does)
+            stat[10]++;
             build_scan_req(rxbuf);
             if (schedule_tx(tend, RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk, true)) {
                 g_state = ST_SCAN_REQ;
@@ -889,7 +874,7 @@ void setMotorRaw(int port, int speed) {
 //%
 int debugStat(int i) {
     if (i == 0) return g_state;
-    if (i < 1 || i > 9) return 0;
+    if (i < 1 || i > 10) return 0;
     return (int)stat[i];
 }
 
