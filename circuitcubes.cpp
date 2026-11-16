@@ -45,17 +45,22 @@ static const uint32_t ADV_AA        = 0x8E89BED6;
 static const uint32_t ADV_CRCINIT   = 0x555555;
 
 static const uint32_t TX_RAMP_US    = 41;     // TXEN -> first preamble bit (fast ramp-up)
-static const uint32_t PREP_LEAD_US  = 600;    // prepare event this long before anchor
+static const uint32_t PREP_LEAD_US  = 1000;   // prepare event this long before anchor (ISR latency budget)
+static const uint32_t PREP_MIN_US   = 40;     // less time than this left before TX: skip the event
 static const uint32_t SCAN_DWELL_US = 25000;  // time per advertising channel
 
-static const uint32_t CONN_INTERVAL_UNITS = 24;     // 30 ms
+static const uint16_t CONN_INTERVAL_UNITS = 24;     // 30 ms
 static const uint32_t CONN_INTERVAL_US    = CONN_INTERVAL_UNITS * 1250;
-static const uint32_t CONN_TIMEOUT_UNITS  = 200;    // 2 s
-static const uint32_t CONN_TIMEOUT_US     = CONN_TIMEOUT_UNITS * 10000;
+static const uint16_t CONN_TIMEOUT_UNITS  = 400;    // 4 s
 static const uint32_t CONN_ESTABLISH_US   = 6 * CONN_INTERVAL_US;
 static const uint8_t  CONN_HOP            = 7;
 static const uint8_t  CONN_WIN_SIZE       = 2;      // x1.25 ms
 static const uint8_t  CONN_WIN_OFFSET     = 1;      // x1.25 ms
+static const uint16_t UPD_INSTANT_EVENTS  = 10;     // LL_CONNECTION_UPDATE_IND instant, events ahead
+
+// why the last connection ended (debugStat 24)
+static const uint8_t CAUSE_TIMEOUT = 1, CAUSE_ESTABLISH = 2, CAUSE_PEER = 3, CAUSE_NOT_CUBE = 4,
+                     CAUSE_USER = 5;
 
 // Nordic UART Service TX/"write" characteristic 6e400002-b5a3-f393-e0a9-e50e24dcca9e (LE)
 static const uint8_t NUS_WRITE_UUID[16] = {
@@ -84,9 +89,12 @@ static uint32_t rng_state;
 
 // debug counters (see debugStat): 1 adv rx ok, 2 adv crc bad, 3 ADV_IND, 4 SCAN_RSP,
 // 5 name match, 6 CONNECT_IND sent, 7 conn events answered, 8 conn events missed, 9 disconnects
-static volatile uint32_t stat[20];   // 18/19: setMotor calls / accepted   // 10 = SCAN_REQ sent
+static volatile uint32_t stat[32];   // 18/19: setMotor calls / accepted   // 10 = SCAN_REQ sent
 // ATT diagnostics: 11 writes sent, 12 write handle, 13 char properties, 14 last ATT opcode received,
 // 15 last ATT error code, 16 opcode that error answered, 17 ATT notifications received
+// link diagnostics: 24 last drop cause (CAUSE_*), 25 reason code of the peer's LL_TERMINATE_IND,
+// 26 events skipped (prepared too late), 27 late TX-end ISRs, 28 conn param requests from the peer,
+// 29 connection updates applied
 static char    last_write[24];
 static uint8_t last_write_len;
 static char    last_name[3][32];          // [0] from ADV_IND, [1] from SCAN_RSP, [2] the cube we matched
@@ -108,24 +116,44 @@ static const uint8_t ADV_CH[3] = { 37, 38, 39 };
 static uint8_t scan_idx;
 static volatile bool scan_rot;
 
-// connection
+// connection (rxbuf is the single TX+RX buffer during a connection, see conn_prepare)
 static uint32_t conn_aa, conn_crc;
-static uint32_t anchor;             // next event anchor (timer us)
+static uint32_t anchor;             // anchor of the next event to prepare (timer us)
 static uint32_t last_rx;            // last valid rx (timer us)
-static uint32_t established_deadline;
 static bool     established;
 static uint8_t  chan_unmapped;
+static uint16_t conn_event;         // counter of the next event to prepare
+static uint16_t cur_event;          // counter of the event prepared last
+static uint16_t conn_interval;      // current parameters (BLE units)
+static uint16_t conn_latency;
+static uint16_t conn_timeout;
 static uint8_t  tx_sn, rx_nesn;
 static volatile bool rx_end_flag, rx_to, rx_crc_ok;
-static bool     disconnect_req;
 static bool     version_sent;
+static bool     peer_term;          // peer sent LL_TERMINATE_IND
+static bool     peer_term_acked;    // ...and an event carrying our ack has been transmitted
+static bool     local_term;         // we terminate (not a Circuit Cube) and rescan
+static uint8_t  term_cause;
 
-// pending LL tx
-static bool     tx_has;
+// current LL PDU: kept, and resent unchanged, until the peer acknowledges it. That includes an
+// empty PDU: replacing an unacknowledged one with data under the same SN would make the peer
+// drop the data as a duplicate while acking it.
+static bool     tx_unacked;
 static uint8_t  tx_llid, tx_len;
 static uint8_t  tx_payload[32];
-static uint8_t  ctrl_buf[16];
-static uint8_t  ctrl_len;
+
+// queued LL control replies
+static const uint8_t CTRL_Q = 3;
+static uint8_t  ctrl_q[CTRL_Q][12];
+static uint8_t  ctrl_q_len[CTRL_Q];
+static uint8_t  ctrl_head, ctrl_count;
+
+// L2CAP signaling (CID 5) reply, and the connection update it may lead to
+static uint8_t  sig_rsp[6];
+static uint8_t  sig_rsp_len;
+static const uint8_t UPD_NONE = 0, UPD_QUEUED = 1, UPD_SENT = 2;
+static uint8_t  upd_state;
+static uint16_t upd_interval, upd_latency, upd_timeout, upd_instant;
 
 // ATT / GATT
 static uint8_t  att_req[8];
@@ -146,9 +174,9 @@ static volatile uint8_t g_dirty;
 // Small helpers
 // ---------------------------------------------------------------------------
 // TIMER0 has only 4 CC registers (CC[4]/CC[5] exist on TIMER3/4 only). CC0 doubles as the
-// "now" scratch register: it is only armed (PPI -> TXEN) for the <150 us between
-// schedule_tx()/conn_prepare() and the start of the transmission, and tnow() is never
-// called inside that window.
+// "now" scratch register: it is only armed (PPI -> TXEN) between schedule_tx() (<150 us) or
+// conn_prepare() (<= PREP_LEAD_US) and the start of the transmission, and tnow() is never
+// called inside that window (both ISRs share one priority, the app thread never calls it).
 static inline uint32_t tnow() {
     T->TASKS_CAPTURE[0] = 1;
     return T->CC[0];
@@ -353,9 +381,9 @@ static void build_connect_ind(const uint8_t *adv) {
     ll[4] = conn_crc; ll[5] = conn_crc >> 8; ll[6] = conn_crc >> 16;
     ll[7] = CONN_WIN_SIZE;
     ll[8] = CONN_WIN_OFFSET; ll[9] = 0;
-    ll[10] = CONN_INTERVAL_UNITS; ll[11] = 0;
+    ll[10] = CONN_INTERVAL_UNITS & 0xFF; ll[11] = CONN_INTERVAL_UNITS >> 8;
     ll[12] = 0; ll[13] = 0;                                 // latency
-    ll[14] = CONN_TIMEOUT_UNITS; ll[15] = 0;
+    ll[14] = CONN_TIMEOUT_UNITS & 0xFF; ll[15] = CONN_TIMEOUT_UNITS >> 8;
     ll[16] = 0xFF; ll[17] = 0xFF; ll[18] = 0xFF; ll[19] = 0xFF; ll[20] = 0x1F;
     ll[21] = CONN_HOP | (0 << 5);                           // SCA 251-500 ppm (conservative)
 }
@@ -521,11 +549,15 @@ static void enter_idle() {
     }
 }
 
-static void go_scan() {
-    stat[9]++;
+// The link is gone: rescan (auto-reconnect) unless the user asked to stay off.
+static void conn_leave(uint8_t cause) {
+    stat[24] = cause;
+    if (cause != CAUSE_USER) stat[9]++;
     if (g_off_req) enter_idle();
     else scan_start();
 }
+
+static inline uint16_t rd16(const uint8_t *p) { return p[0] | (p[1] << 8); }
 
 static void att_queue(const uint8_t *p, uint8_t n) {
     memcpy(att_req, p, n);
@@ -544,14 +576,20 @@ static void conn_begin() {
     anchor = tend + 1250 + 1250 * CONN_WIN_OFFSET + 400;
     last_rx = tend;
     established = false;
-    established_deadline = tend + CONN_ESTABLISH_US + 10000;
     chan_unmapped = 0;
+    conn_event = 0;
+    conn_interval = CONN_INTERVAL_UNITS;
+    conn_latency = 0;
+    conn_timeout = CONN_TIMEOUT_UNITS;
     tx_sn = rx_nesn = 0;
-    tx_has = false;
-    ctrl_len = 0;
-    disconnect_req = false;
+    tx_unacked = false;
+    ctrl_head = ctrl_count = 0;
+    sig_rsp_len = 0;
+    upd_state = UPD_NONE;
     version_sent = false;
     term_sent = false;
+    peer_term = peer_term_acked = false;
+    local_term = false;
     att_rsp_len = 0;
     att_wait_rsp = false;
     g_ready = false;
@@ -568,21 +606,48 @@ static void conn_begin() {
     T->INTENSET = TIMER_INTENSET_COMPARE1_Msk;
 }
 
-static void wrap_att(const uint8_t *att, uint8_t n) {
-    tx_payload[0] = n; tx_payload[1] = 0; tx_payload[2] = 4; tx_payload[3] = 0;
-    memcpy(tx_payload + 4, att, n);
+static void wrap_l2cap(uint8_t cid, const uint8_t *p, uint8_t n) {
+    tx_payload[0] = n; tx_payload[1] = 0; tx_payload[2] = cid; tx_payload[3] = 0;
+    memcpy(tx_payload + 4, p, n);
     tx_len = n + 4;
     tx_llid = 2;
-    tx_has = true;
 }
+static inline void wrap_att(const uint8_t *att, uint8_t n) { wrap_l2cap(4, att, n); }
 
+static void put16(uint8_t *p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
+
+// Pick the next PDU to send; leaves an empty PDU (LLID 1, length 0) when nothing is queued.
 static void fetch_tx() {
-    if (ctrl_len) {
-        memcpy(tx_payload, ctrl_buf, ctrl_len);
-        tx_len = ctrl_len;
+    tx_llid = 1;
+    tx_len = 0;
+    if (ctrl_count) {
+        tx_len = ctrl_q_len[ctrl_head];
+        memcpy(tx_payload, ctrl_q[ctrl_head], tx_len);
         tx_llid = 3;
-        tx_has = true;
-        ctrl_len = 0;
+        ctrl_head = (ctrl_head + 1) % CTRL_Q;
+        ctrl_count--;
+        return;
+    }
+    if (sig_rsp_len) {
+        wrap_l2cap(5, sig_rsp, sig_rsp_len);
+        sig_rsp_len = 0;
+        return;
+    }
+    if (upd_state == UPD_QUEUED) {
+        // LL_CONNECTION_UPDATE_IND. With WinOffset 0 the new timing starts at the instant's
+        // anchor (old interval), so the master simply switches interval at the instant.
+        upd_instant = cur_event + UPD_INSTANT_EVENTS;
+        uint8_t *c = tx_payload;
+        c[0] = 0x00;
+        c[1] = 1;                       // WinSize 1.25 ms
+        put16(c + 2, 0);                // WinOffset
+        put16(c + 4, upd_interval);
+        put16(c + 6, upd_latency);
+        put16(c + 8, upd_timeout);
+        put16(c + 10, upd_instant);
+        tx_len = 12;
+        tx_llid = 3;
+        upd_state = UPD_SENT;
         return;
     }
     if (att_rsp_len) {
@@ -636,18 +701,25 @@ static void fetch_tx() {
 }
 
 static void ctrl_reply(const uint8_t *p, uint8_t n) {
-    if (ctrl_len) return;
-    memcpy(ctrl_buf, p, n);
-    ctrl_len = n;
+    if (ctrl_count >= CTRL_Q || n > sizeof(ctrl_q[0])) return;
+    uint8_t i = (ctrl_head + ctrl_count) % CTRL_Q;
+    memcpy(ctrl_q[i], p, n);
+    ctrl_q_len[i] = n;
+    ctrl_count++;
 }
 
 static void handle_ll_control(const uint8_t *d, uint8_t len) {
     if (len < 1) return;
     uint8_t op = d[0];
     switch (op) {
-    case 0x02:  // LL_TERMINATE_IND
-        disconnect_req = true;
+    case 0x02:  // LL_TERMINATE_IND: ack it in the next event, then leave
+        peer_term = true;
+        if (len >= 2) stat[25] = d[1];
         break;
+    case 0x14: {// LL_LENGTH_REQ: keep the default 27 bytes / 328 us both ways
+        uint8_t r[9] = { 0x15, 27, 0, 0x48, 0x01, 27, 0, 0x48, 0x01 };
+        ctrl_reply(r, 9);
+        break; }
     case 0x08:  // LL_FEATURE_REQ
     case 0x0E: {// LL_SLAVE_FEATURE_REQ
         uint8_t r[9] = { 0x09, 0, 0, 0, 0, 0, 0, 0, 0 };
@@ -664,8 +736,8 @@ static void handle_ll_control(const uint8_t *d, uint8_t len) {
         uint8_t r[1] = { 0x13 };
         ctrl_reply(r, 1);
         break; }
-    case 0x07: case 0x09: case 0x13: case 0x11:
-        break;  // responses: ignore
+    case 0x07: case 0x09: case 0x0D: case 0x11: case 0x13: case 0x15: case 0x19:
+        break;  // responses / indications needing no reply: ignore
     default: {
         uint8_t r[2] = { 0x07, op };            // LL_UNKNOWN_RSP
         ctrl_reply(r, 2);
@@ -696,12 +768,12 @@ static void att_rx(const uint8_t *p, uint8_t n) {
             }
         }
         if (last && last < 0xFFFF) att_request_discovery(last + 1);
-        else disconnect_req = true;     // reached end: not a Circuit Cube
+        else local_term = true;         // reached end: not a Circuit Cube
         break; }
     case 0x01:      // Error Response
         if (n >= 2 && p[1] == 0x08) {
             att_inflight = false;
-            if (!g_ready) disconnect_req = true;    // Attribute Not Found: no NUS write char
+            if (!g_ready) local_term = true;        // Attribute Not Found: no NUS write char
         } else if (n >= 2 && (p[1] == 0x12 || p[1] == 0x52)) {
             att_wait_rsp = false;
         }
@@ -718,16 +790,57 @@ static void att_rx(const uint8_t *p, uint8_t n) {
         att_rsp[0] = 0x1E;
         att_rsp_len = 1;
         break; }
-    case 0x04: case 0x06: case 0x0A: case 0x0C: case 0x0E: case 0x10:
-    case 0x12: case 0x16: case 0x18: case 0x20: {   // requests we do not serve: Request Not Supported
+    // Requests the peer sends us. An unanswered request stalls its ATT bearer and after 30 s
+    // most stacks drop the link, so every request gets an Error Response.
+    case 0x04: case 0x06: case 0x08: case 0x10:     // discovery: our database is empty
+        att_rsp[0] = 0x01;
+        att_rsp[1] = p[0];
+        att_rsp[2] = n >= 3 ? p[1] : 0; att_rsp[3] = n >= 3 ? p[2] : 0;
+        att_rsp[4] = 0x0A;          // Attribute Not Found
+        att_rsp_len = 5;
+        break;
+    case 0x0A: case 0x0C: case 0x0E: case 0x12: case 0x16: case 0x18: case 0x20:
         att_rsp[0] = 0x01;
         att_rsp[1] = p[0];
         att_rsp[2] = 0; att_rsp[3] = 0;
-        att_rsp[4] = 0x06;
+        att_rsp[4] = 0x06;          // Request Not Supported
         att_rsp_len = 5;
-        break; }
+        break;
     default:
         break;      // notifications, etc.: ignored
+    }
+}
+
+// L2CAP LE signaling channel. Peripherals ask for their preferred connection parameters with a
+// Connection Parameter Update Request; many (e.g. Nordic's ble_conn_params) disconnect after a
+// few unanswered or failed attempts, so accept it and apply it with LL_CONNECTION_UPDATE_IND.
+static void sig_rx(const uint8_t *p, uint16_t n) {
+    if (n < 4) return;
+    uint8_t code = p[0], id = p[1];
+    if (code == 0x12 && n >= 12) {          // Connection Parameter Update Request
+        stat[28]++;
+        uint16_t imin = rd16(p + 4), imax = rd16(p + 6), lat = rd16(p + 8), to = rd16(p + 10);
+        uint16_t iv = CONN_INTERVAL_UNITS;
+        if (iv < imin) iv = imin;
+        if (iv > imax) iv = imax;
+        // spec limits; supervision timeout must exceed (1 + latency) * interval * 2
+        bool ok = imin >= 6 && imin <= imax && imax <= 3200 && lat <= 499 &&
+                  to >= 10 && to <= 3200 && (uint32_t)to * 4 > (uint32_t)(1 + lat) * iv &&
+                  upd_state == UPD_NONE;
+        sig_rsp[0] = 0x13; sig_rsp[1] = id; sig_rsp[2] = 2; sig_rsp[3] = 0;
+        sig_rsp[4] = ok ? 0 : 1; sig_rsp[5] = 0;  // 0 accepted, 1 rejected
+        sig_rsp_len = 6;
+        if (ok && (iv != conn_interval || lat != conn_latency || to != conn_timeout)) {
+            upd_interval = iv;
+            upd_latency = lat;
+            upd_timeout = to;
+            upd_state = UPD_QUEUED;     // sent by fetch_tx after the response above
+        }
+    } else if (code == 0x06 || code == 0x14 || code == 0x17 || code == 0x19) {
+        // other requests: Command Reject, "command not understood"
+        sig_rsp[0] = 0x01; sig_rsp[1] = id; sig_rsp[2] = 2; sig_rsp[3] = 0;
+        sig_rsp[4] = 0; sig_rsp[5] = 0;
+        sig_rsp_len = 6;
     }
 }
 
@@ -741,17 +854,19 @@ static void process_rx() {
 
     if (nesn != tx_sn) {            // peer acknowledged our last PDU
         tx_sn ^= 1;
-        tx_has = false;
+        tx_unacked = false;
     }
     if (sn == rx_nesn) {            // new data from peer
         rx_nesn ^= 1;
         const uint8_t *d = &rxbuf[2];
         if (llid == 3) {
             handle_ll_control(d, len);
-        } else if ((llid == 2 || llid == 1) && len >= 4) {
-            uint16_t l2len = d[0] | (d[1] << 8);
-            uint16_t cid = d[2] | (d[3] << 8);
-            if (cid == 4 && l2len + 4 <= len) att_rx(d + 4, l2len);
+        } else if (llid == 2 && len >= 4) {     // L2CAP start (MTU 23: never fragmented)
+            uint16_t l2len = rd16(d);
+            uint16_t cid = rd16(d + 2);
+            if (l2len + 4 > len) return;
+            if (cid == 4) att_rx(d + 4, l2len);
+            else if (cid == 5) sig_rx(d + 4, l2len);
         }
     }
 }
@@ -759,66 +874,107 @@ static void process_rx() {
 static void finish_event(bool got) {
     g_phase = PH_NONE;
     T->INTENCLR = TIMER_INTENCLR_COMPARE3_Msk;
-    uint32_t now = tnow();
     if (got) {
         stat[7]++;
         process_rx();
-        last_rx = now;
+        last_rx = tnow();
         established = true;
+    } else {
+        stat[8]++;
     }
-    if (!got) stat[8]++;
-    uint32_t limit = established ? CONN_TIMEOUT_US : CONN_ESTABLISH_US;
-    if (term_sent && !tx_has) enter_idle();     // terminate acknowledged: link closed
-    else if (disconnect_req || (int32_t)(now - last_rx) > (int32_t)limit) go_scan();
+    if (term_sent && !tx_unacked) conn_leave(term_cause);   // our terminate acknowledged
+    else if (peer_term && peer_term_acked) conn_leave(CAUSE_PEER);
+    // supervision timeout is checked in conn_prepare, which also runs when an event is lost
+}
+
+// Advance to the next connection event: counter, channel, anchor. Called once per event even
+// when the event is skipped, so hopping and the update instant stay in step with the peer.
+static uint32_t next_event() {
+    uint32_t a = anchor;
+    cur_event = conn_event++;
+    chan_unmapped = (chan_unmapped + CONN_HOP) % 37;
+    if (upd_state == UPD_SENT && cur_event == upd_instant) {
+        conn_interval = upd_interval;
+        conn_latency = upd_latency;
+        conn_timeout = upd_timeout;
+        upd_state = UPD_NONE;
+        stat[29]++;
+    }
+    anchor += (uint32_t)conn_interval * 1250;
+    return a;
 }
 
 static void conn_prepare() {
+    g_phase = PH_NONE;
+    T->INTENCLR = TIMER_INTENCLR_COMPARE3_Msk;
     if (R->STATE & 0xF) radio_force_disable();
-    uint32_t at = anchor - TX_RAMP_US;
-    uint32_t this_anchor = anchor;
-    anchor += CONN_INTERVAL_US;
-    T->CC[1] = anchor - PREP_LEAD_US;
-    if (!in_future(at, 15)) return;             // missed this event
+    uint32_t now = tnow();
 
-    chan_unmapped = (chan_unmapped + CONN_HOP) % 37;
+    uint32_t limit = established ? (uint32_t)conn_timeout * 10000 : CONN_ESTABLISH_US;
+    if ((int32_t)(now - last_rx) > (int32_t)limit) {
+        conn_leave(established ? CAUSE_TIMEOUT : CAUSE_ESTABLISH);
+        return;
+    }
+
+    // Skip (but still count) every event whose TX time is already too close or past.
+    uint32_t at;
+    for (;;) {
+        at = next_event() - TX_RAMP_US;
+        if ((int32_t)(at - now) > (int32_t)PREP_MIN_US) break;
+        stat[26]++;
+    }
+    T->CC[1] = anchor - PREP_LEAD_US;
     set_channel(chan_unmapped);
 
-    if (!tx_has) fetch_tx();
-    if (g_off_req && !tx_has && !term_sent) {   // LL_TERMINATE_IND, reason 0x13 (remote user terminated)
-        tx_payload[0] = 0x02;
-        tx_payload[1] = 0x13;
-        tx_len = 2;
-        tx_llid = 3;
-        tx_has = true;
-        term_sent = true;
+    if (!tx_unacked) {              // previous PDU acknowledged: pick a new one
+        if ((g_off_req || local_term) && !term_sent) {
+            // LL_TERMINATE_IND, 0x13 remote user terminated
+            tx_payload[0] = 0x02;
+            tx_payload[1] = 0x13;
+            tx_len = 2;
+            tx_llid = 3;
+            term_sent = true;
+            term_cause = g_off_req ? CAUSE_USER : CAUSE_NOT_CUBE;
+        } else if (peer_term || term_sent) {
+            tx_llid = 1;
+            tx_len = 0;
+        } else {
+            fetch_tx();
+        }
     }
-    txdma[0] = (tx_has ? tx_llid : 1) | (rx_nesn << 2) | (tx_sn << 3);
-    txdma[1] = tx_has ? tx_len : 0;
-    if (tx_has) memcpy(&txdma[2], tx_payload, tx_len);
+    if (peer_term) peer_term_acked = true;      // this PDU carries the ack (NESN)
+
+    // One buffer for TX and the reply: the reply is received into the same memory right after
+    // our packet, so a late ISR cannot leave PACKETPTR pointing at the wrong buffer.
+    rxbuf[0] = tx_llid | (rx_nesn << 2) | (tx_sn << 3);
+    rxbuf[1] = tx_len;
+    memcpy(&rxbuf[2], tx_payload, tx_len);
+    tx_unacked = true;
 
     rx_end_flag = false;
     rx_to = false;
     clr(&R->EVENTS_END);
     clr(&R->EVENTS_DISABLED);
     clr(&R->EVENTS_ADDRESS);
-    R->PACKETPTR = (uint32_t)txdma;
+    R->PACKETPTR = (uint32_t)rxbuf;
     R->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk |
                 RADIO_SHORTS_DISABLED_RXEN_Msk;
     g_phase = PH_TX;
     T->CC[0] = at;
     clr(&T->EVENTS_COMPARE[0]);
     tx_trigger_on();
-    (void)this_anchor;
 }
 
 static void conn_tx_end() {
     uint32_t tend = T->CC[2];
     tx_trigger_off();
-    R->PACKETPTR = (uint32_t)rxbuf;
+    // The reply's preamble starts 150 us after our END, its ADDRESS event ~40 us later. Clear our
+    // own TX ADDRESS event only while that cannot have happened yet; when this ISR runs late, keep
+    // it (no rx timeout this event, conn_prepare cleans up) rather than cut off a reply mid-air.
+    if ((int32_t)(tnow() - tend) < 140) clr(&R->EVENTS_ADDRESS);
+    else stat[27]++;
     wait_rx_started();
     R->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk;   // no more RXEN
-    clr(&R->EVENTS_ADDRESS);
-    clr(&R->EVENTS_END);
     g_phase = PH_RX;
     T->CC[3] = tend + 400;      // response must have started by then
     clr(&T->EVENTS_COMPARE[3]);
@@ -949,8 +1105,10 @@ static void stack_init() {
 
     NVIC_SetVector(RADIO_IRQn, (uint32_t)cc_radio_isr);
     NVIC_SetVector(CC_TIMER_IRQn, (uint32_t)cc_timer_isr);
+    // Both at the highest priority: CODAL's serial/GPIOTE ISRs run at 1-2 and must not delay
+    // connection events. Equal priority also means these two never preempt each other.
     NVIC_SetPriority(RADIO_IRQn, 0);
-    NVIC_SetPriority(CC_TIMER_IRQn, 1);
+    NVIC_SetPriority(CC_TIMER_IRQn, 0);
     NVIC_ClearPendingIRQ(RADIO_IRQn);
     NVIC_ClearPendingIRQ(CC_TIMER_IRQn);
     NVIC_EnableIRQ(RADIO_IRQn);
@@ -1007,10 +1165,13 @@ int debugStat(int i) {
     if (i == 0) return g_state;
     // live queue state: 20 dirty mask, 21 LL PDU waiting for ack, 22 ATT request in flight, 23 ATT reply queued
     if (i == 20) return g_dirty;
-    if (i == 21) return tx_has;
+    if (i == 21) return tx_unacked;
     if (i == 22) return att_inflight;
     if (i == 23) return att_rsp_len;
-    if (i < 1 || i > 19) return 0;
+    // 30 current connection interval (ms), 31 current supervision timeout (ms)
+    if (i == 30) return conn_interval * 5 / 4;
+    if (i == 31) return conn_timeout * 10;
+    if (i < 1 || i > 29) return 0;
     return (int)stat[i];
 }
 

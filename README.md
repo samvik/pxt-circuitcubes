@@ -44,8 +44,13 @@ basic.forever(function () {
 * `circuitcubes.cpp` disables the SoftDevice if one is enabled (`sd_softdevice_disable`),
   starts HFXO, and drives `NRF_RADIO` directly (BLE 1 Mbit, whitening, CRC24):
   * scan 37/38/39, match the local name in `ADV_IND`, answer with `CONNECT_IND` 150 µs after it
-  * master connection events (30 ms interval, 2 s supervision timeout, all 37 channels, CSA#1),
-    SN/NESN handling, replies to LL feature/version/ping/terminate, `LL_UNKNOWN_RSP` otherwise
+  * master connection events (30 ms interval, 4 s supervision timeout, all 37 channels, CSA#1),
+    SN/NESN handling (an unacknowledged PDU, empty or not, is resent unchanged), replies to
+    LL feature/version/ping/length/terminate, `LL_UNKNOWN_RSP` otherwise
+  * events the CPU was too late for are skipped but still counted, so channel hopping stays in
+    step with the cube
+  * L2CAP *Connection Parameter Update Requests* from the cube are accepted and applied with
+    `LL_CONNECTION_UPDATE_IND` (interval closest to 30 ms in the requested range)
   * ATT *Read By Type* (`0x2803`) to find characteristic `6e400002-b5a3-f393-e0a9-e50e24dcca9e`,
     then ATT *Write Command* `0x52` (or *Write Request* `0x12` if the characteristic only supports that)
   * latest-value-wins per port: only the newest speed of each port is sent, up to three commands per packet
@@ -68,6 +73,10 @@ Other extensions that use the radio but set no such value cannot be detected thi
 
 * One cube at a time. Timing constants to tune if another cube/board misbehaves: `TX_RAMP_US`,
   `PREP_LEAD_US`, `SCAN_REQ_ADJ_US` and `CONNECT_IND_ADJ_US` at the top of `circuitcubes.cpp`.
+* If the link still drops, the test program's `link:` serial line tells why: `cause` 1 = supervision
+  timeout (radio/timing), 3 = the cube terminated (`peerReason` is its HCI reason code, e.g.
+  `0x3B`=59 unacceptable connection parameters), and `skipped`/`lateIsr` count events the
+  CPU was too busy for.
 * Cubes put their name in the scan response, so the scanner is *active* (it sends SCAN_REQ to every
   connectable advertiser nearby).
 * No encryption/pairing, no MTU exchange (default 23), no notifications (RX characteristic unused),

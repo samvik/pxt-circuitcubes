@@ -59,7 +59,12 @@ namespace circuitCubes {
 
     /**
      * Radio counters: 0 state(1 scan,3 connected), 1 adv ok, 2 adv bad CRC, 3 ADV_IND,
-     * 4 SCAN_RSP, 5 name match, 6 CONNECT_IND sent, 7 events answered, 8 events missed, 9 disconnects
+     * 4 SCAN_RSP, 5 name match, 6 CONNECT_IND sent, 7 events answered, 8 events missed, 9 disconnects,
+     * 24 last drop cause (1 supervision timeout, 2 failed to establish, 3 cube terminated,
+     * 4 not a Circuit Cube, 5 user disconnect), 25 cube's terminate reason code,
+     * 26 events skipped (prepared too late), 27 late TX-end interrupts,
+     * 28 connection parameter requests from the cube, 29 connection updates applied,
+     * 30 connection interval (ms), 31 supervision timeout (ms)
      */
     //% shim=circuitcubes::debugStat blockHidden=true
     export function debugStat(index: number): number {
