@@ -1,0 +1,28 @@
+{
+    "name": "pxt-circuitcubes",
+    "version": "0.1.0",
+    "description": "Control Circuit Cubes Bluetooth Battery Cube motors directly from a micro:bit v2 (BLE Central, bare-metal radio)",
+    "license": "MIT",
+    "dependencies": {
+        "core": "*"
+    },
+    "files": [
+        "README.md",
+        "main.ts",
+        "shims.d.ts",
+        "circuitcubes.cpp"
+    ],
+    "testFiles": [
+        "test.ts"
+    ],
+    "public": true,
+    "targetVersions": {
+        "target": "7.0.0"
+    },
+    "supportedTargets": [
+        "microbit"
+    ],
+    "disablesVariants": [
+        "mbdal"
+    ]
+}

@@ -1,0 +1,8 @@
+#!/bin/bash
+# Intercept pxt's CODAL docker step (image can't be pulled) and run it on the host.
+case "$*" in
+  *pext/yotta:latest*)
+    host=$(echo "$*" | sed -E 's/.*-v ([^: ]+):\/src.*/\1/')
+    cd "$host" && CMAKE_POLICY_VERSION_MINIMUM=3.5 exec python3 build.py ;;
+  *) exec /usr/bin/docker "$@" ;;
+esac
