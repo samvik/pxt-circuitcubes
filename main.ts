@@ -6,6 +6,11 @@
  * (circuitcubes.cpp); this file only exposes the blocks.
  */
 
+declare namespace control {
+    //% shim=control::deviceDalVersion
+    function deviceDalVersion(): string;
+}
+
 enum CubePort {
     //% block="A"
     A = 1,
@@ -25,18 +30,10 @@ namespace circuitCubes {
     // On hardware these bind to circuitcubes.cpp. The simulator has no
     // implementation of them, so every call is guarded with isSim().
 
-    // Probe once: on hardware the shim exists, in the simulator calling it throws.
-    let simMode = -1;
+    // control.deviceDalVersion() exists in the simulator (returns "sim"); on hardware
+    // it is provided by circuitcubes.cpp and returns something else.
     function isSim(): boolean {
-        if (simMode < 0) {
-            simMode = 0;
-            try {
-                hwDebugStat(0);
-            } catch (e) {
-                simMode = 1;
-            }
-        }
-        return simMode == 1;
+        return control.deviceDalVersion() == "sim";
     }
 
     //% shim=circuitcubes::startConnect

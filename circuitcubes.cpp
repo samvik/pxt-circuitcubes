@@ -1233,3 +1233,11 @@ void stopAll() {
 }
 
 } // namespace circuitcubes
+
+// Lets the TypeScript layer tell hardware from the simulator (which returns "sim").
+namespace control {
+//%
+String deviceDalVersion() {
+    return mkString("hw", 2);
+}
+}
