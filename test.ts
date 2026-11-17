@@ -1,7 +1,7 @@
-// Test harness. Connects only to the cube whose name contains "C25E" (change it to your cube). Matrix: X while not connected, tick when connected.
+// Test harness. Connects to the first Circuit Cube found (use connectToNamed to pick one). Matrix: X while not connected, tick when connected.
 // A: run motor A for 1 s   B: toggle motor A   A+B: stop all
-// Logo touch: disconnect / connect again. Radio diagnostics go to serial (115200 baud) once per second.
-circuitCubes.connectToNamed("C25E")
+// Logo long press (hold ~1 s): disconnect / connect again. Radio diagnostics go to serial (115200 baud) once per second.
+circuitCubes.connect()
 let running = false
 let wantConnected = true
 input.onButtonPressed(Button.A, function () {
@@ -14,10 +14,10 @@ input.onButtonPressed(Button.B, function () {
 input.onButtonPressed(Button.AB, function () {
     circuitCubes.stopAll()
 })
-input.onLogoEvent(TouchButtonEvent.Pressed, function () {
+input.onLogoEvent(TouchButtonEvent.LongPressed, function () {
     wantConnected = !wantConnected
     if (wantConnected) {
-        circuitCubes.connectToNamed("C25E")
+        circuitCubes.connect()
     } else {
         circuitCubes.disconnect()
     }
@@ -65,7 +65,15 @@ control.inBackground(function () {
             + " paramReq=" + circuitCubes.debugStat(28)
             + " updates=" + circuitCubes.debugStat(29)
             + " interval=" + circuitCubes.debugStat(30)
-            + "ms timeout=" + circuitCubes.debugStat(31) + "ms")
+            + "ms timeout=" + circuitCubes.debugStat(31) + "ms"
+            + " want=" + (wantConnected ? 1 : 0)
+            + " connCalls=" + circuitCubes.debugStat(32)
+            + " discCalls=" + circuitCubes.debugStat(33))
+        serial.writeLine("  scan: reqLate=" + circuitCubes.debugStat(34)
+            + " connLate=" + circuitCubes.debugStat(35)
+            + " cubeRsp=" + circuitCubes.debugStat(36)
+            + " targetAdv=" + circuitCubes.debugStat(37)
+            + " rspIsrLate=" + circuitCubes.debugStat(38))
         basic.pause(1000)
     }
 })

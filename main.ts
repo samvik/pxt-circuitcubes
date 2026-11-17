@@ -22,37 +22,58 @@ namespace circuitCubes {
     let simConnected = false;
 
     // ---- native shims -------------------------------------------------------
-    // On hardware these bind to circuitcubes.cpp. The bodies are only used by
-    // the simulator.
+    // On hardware these bind to circuitcubes.cpp. The simulator has no
+    // implementation of them, so every call is guarded with isSim().
+
+    // Probe once: on hardware the shim exists, in the simulator calling it throws.
+    let simMode = -1;
+    function isSim(): boolean {
+        if (simMode < 0) {
+            simMode = 0;
+            try {
+                hwDebugStat(0);
+            } catch (e) {
+                simMode = 1;
+            }
+        }
+        return simMode == 1;
+    }
 
     //% shim=circuitcubes::startConnect
-    function nativeConnect(): void {
-        simConnected = true;
-    }
+    function hwConnect(): void { }
 
     //% shim=circuitcubes::isConnected
-    function nativeIsConnected(): boolean {
-        return simConnected;
-    }
+    function hwIsConnected(): boolean { return false; }
 
     //% shim=circuitcubes::setMotorRaw
-    function nativeSetMotor(port: number, speed: number): void {
-        // simulator: nothing to drive
-    }
+    function hwSetMotor(port: number, speed: number): void { }
 
     //% shim=circuitcubes::setNameFilter
-    function nativeSetNameFilter(name: string): void {
-        // simulator: nothing to filter
-    }
+    function hwSetNameFilter(name: string): void { }
 
     //% shim=circuitcubes::disconnect
-    function nativeDisconnect(): void {
-        simConnected = false;
-    }
+    function hwDisconnect(): void { }
 
     //% shim=circuitcubes::stopAll
+    function hwStopAll(): void { }
+
+    function nativeConnect(): void {
+        if (isSim()) simConnected = true; else hwConnect();
+    }
+    function nativeIsConnected(): boolean {
+        return isSim() ? simConnected : hwIsConnected();
+    }
+    function nativeSetMotor(port: number, speed: number): void {
+        if (!isSim()) hwSetMotor(port, speed);
+    }
+    function nativeSetNameFilter(name: string): void {
+        if (!isSim()) hwSetNameFilter(name);
+    }
+    function nativeDisconnect(): void {
+        if (isSim()) simConnected = false; else hwDisconnect();
+    }
     function nativeStopAll(): void {
-        // simulator: nothing to drive
+        if (!isSim()) hwStopAll();
     }
 
     // ---- diagnostics (hidden) ------------------------------------------------
@@ -64,18 +85,26 @@ namespace circuitCubes {
      * 4 not a Circuit Cube, 5 user disconnect), 25 cube's terminate reason code,
      * 26 events skipped (prepared too late), 27 late TX-end interrupts,
      * 28 connection parameter requests from the cube, 29 connection updates applied,
-     * 30 connection interval (ms), 31 supervision timeout (ms)
+     * 30 connection interval (ms), 31 supervision timeout (ms), 32 connect() calls, 33 disconnect() calls,
+     * 34 SCAN_REQ skipped (too late), 35 CONNECT_IND skipped (too late), 36 scan responses naming
+     * any cube, 37 adverts from the target address, 38 scan-response interrupt ran late
      */
-    //% shim=circuitcubes::debugStat blockHidden=true
+    //% blockHidden=true
     export function debugStat(index: number): number {
-        return 0;
+        return isSim() ? 0 : hwDebugStat(index);
     }
 
+    //% shim=circuitcubes::debugStat
+    function hwDebugStat(index: number): number { return 0; }
+
     /** Names: kind 0 = last advertisement, 1 = last scan response, 2 = the cube that was matched, 3 = last motor command written */
-    //% shim=circuitcubes::debugName blockHidden=true
+    //% blockHidden=true
     export function debugName(kind: number): string {
-        return "";
+        return isSim() ? "" : hwDebugName(kind);
     }
+
+    //% shim=circuitcubes::debugName
+    function hwDebugName(kind: number): string { return ""; }
 
     // ---- blocks -------------------------------------------------------------
 

@@ -89,12 +89,15 @@ static uint32_t rng_state;
 
 // debug counters (see debugStat): 1 adv rx ok, 2 adv crc bad, 3 ADV_IND, 4 SCAN_RSP,
 // 5 name match, 6 CONNECT_IND sent, 7 conn events answered, 8 conn events missed, 9 disconnects
-static volatile uint32_t stat[32];   // 18/19: setMotor calls / accepted   // 10 = SCAN_REQ sent
+static volatile uint32_t stat[40];   // 18/19: setMotor calls / accepted   // 10 = SCAN_REQ sent
 // ATT diagnostics: 11 writes sent, 12 write handle, 13 char properties, 14 last ATT opcode received,
 // 15 last ATT error code, 16 opcode that error answered, 17 ATT notifications received
 // link diagnostics: 24 last drop cause (CAUSE_*), 25 reason code of the peer's LL_TERMINATE_IND,
 // 26 events skipped (prepared too late), 27 late TX-end ISRs, 28 conn param requests from the peer,
 // 29 connection updates applied
+// scan diagnostics: 34 SCAN_REQ skipped (ISR too late), 35 CONNECT_IND skipped (ISR too late),
+// 36 scan responses naming a cube (ignoring the name filter), 37 ADV_INDs from the target address,
+// 38 scan response ISR ran late
 static char    last_write[24];
 static uint8_t last_write_len;
 static char    last_name[3][32];          // [0] from ADV_IND, [1] from SCAN_RSP, [2] the cube we matched
@@ -115,6 +118,7 @@ static volatile bool rsp_end, rsp_to;
 static const uint8_t ADV_CH[3] = { 37, 38, 39 };
 static uint8_t scan_idx;
 static volatile bool scan_rot;
+static bool hop_after_rsp;          // a matching scan response arrived: follow the cube to the next channel
 
 // connection (rxbuf is the single TX+RX buffer during a connection, see conn_prepare)
 static uint32_t conn_aa, conn_crc;
@@ -311,12 +315,15 @@ static void radio_force_disable() {
 // ---------------------------------------------------------------------------
 // Scanner / initiator
 // ---------------------------------------------------------------------------
-static void scan_start() {
+// keep_target: a dropped link rescans for the same cube by address, so it can reconnect on its
+// very first ADV_IND instead of first needing a scan response with the name.
+static void scan_start(bool keep_target = false) {
     radio_force_disable();
     T->INTENCLR = TIMER_INTENCLR_COMPARE3_Msk;
     g_phase = PH_NONE;
     g_ready = false;
-    have_target = false;
+    hop_after_rsp = false;
+    if (!keep_target) have_target = false;
     g_state = ST_SCAN;
     scan_idx = 0;
     scan_rot = false;
@@ -465,7 +472,9 @@ static void scan_rx_end() {
         remember_name(&rxbuf[8], len - 6, 0);
         bool by_name = name_matches(&rxbuf[8], len - 6);
         if (by_name) remember_name(&rxbuf[8], len - 6, 2);
-        bool match = by_name || (have_target && memcmp(adva, target_addr, 6) == 0);
+        bool by_addr = have_target && memcmp(adva, target_addr, 6) == 0;
+        if (by_addr) stat[37]++;
+        bool match = by_name || by_addr;
         if (match && type == 0) {
             stat[5]++;
             build_connect_ind(rxbuf);
@@ -475,54 +484,80 @@ static void scan_rx_end() {
                 g_state = ST_INIT_TX;
                 return;
             }
+            stat[35]++;
         } else if (!match) {
             // name may be in the scan response: ask for it (active scan, like a phone does)
-            stat[10]++;
             build_scan_req(rxbuf);
             if (schedule_tx(tend, RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk, true,
                             SCAN_REQ_ADJ_US)) {
+                stat[10]++;
                 g_state = ST_SCAN_REQ;
                 return;
             }
+            stat[34]++;
         }
     }
     R->TASKS_START = 1;     // radio is in RXIDLE: keep listening
 }
 
+// The scan response is received into txdma, the buffer the SCAN_REQ was sent from: the radio
+// latches PACKETPTR ~45 us after our END, so switching buffers here would race with a late ISR
+// (and the response would land in the wrong buffer and be lost).
 static void scan_req_tx_end() {
     uint32_t tend = T->CC[2];
     tx_trigger_off();
-    R->PACKETPTR = (uint32_t)rxbuf;
     wait_rx_started();
     R->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk;   // no more RXEN
-    clr(&R->EVENTS_ADDRESS);
-    clr(&R->EVENTS_END);
+    // the response's ADDRESS event comes ~190 us after our END: only clear our own one
+    uint32_t now = tnow();
+    if ((int32_t)(now - tend) < 140) clr(&R->EVENTS_ADDRESS);
+    else stat[38]++;
     rsp_end = false;
     rsp_to = false;
-    T->CC[3] = tend + 400;
+    uint32_t to = tend + 400;
+    if ((int32_t)(to - now) < 5) to = now + 5;      // never arm a compare in the past
+    T->CC[3] = to;
     clr(&T->EVENTS_COMPARE[3]);
     T->INTENSET = TIMER_INTENSET_COMPARE3_Msk;
     g_state = ST_SCAN_RSP;
 }
 
+static bool name_is_cube(const uint8_t *ad, uint8_t n) {
+    const uint8_t *nm;
+    uint8_t nl;
+    if (!find_name(ad, n, &nm, &nl)) return false;
+    return (nl >= 5 && memcmp(nm, "Tenka", 5) == 0) || (nl >= 12 && memcmp(nm, "Circuit Cube", 12) == 0);
+}
+
 static void scan_rsp_end() {
     rsp_end = true;
+    const uint8_t *b = txdma;
     if (!(R->CRCSTATUS & 1)) return;
-    uint8_t len = rxbuf[1] & 0x3F;
-    if ((rxbuf[0] & 0x0F) != 4 || len < 6 || len > 37) return;
-    if (memcmp(&rxbuf[2], cur_adva, 6) != 0) return;
+    uint8_t len = b[1] & 0x3F;
+    if ((b[0] & 0x0F) != 4 || len < 6 || len > 37) return;
+    if (memcmp(&b[2], cur_adva, 6) != 0) return;
     stat[4]++;
-    remember_name(&rxbuf[8], len - 6, 1);
-    if (name_matches(&rxbuf[8], len - 6)) {
-        remember_name(&rxbuf[8], len - 6, 2);
+    remember_name(&b[8], len - 6, 1);
+    if (name_is_cube(&b[8], len - 6)) stat[36]++;
+    if (name_matches(&b[8], len - 6)) {
+        remember_name(&b[8], len - 6, 2);
         memcpy(target_addr, cur_adva, 6);
         have_target = true;     // connect on its next ADV_IND
+        // The cube sends the same advertising event on the next channel within a few ms (37 ->
+        // 38 -> 39): follow it there instead of waiting a whole advertising interval.
+        hop_after_rsp = scan_idx < 2;
     }
 }
 
 static void resume_scan() {
     T->INTENCLR = TIMER_INTENCLR_COMPARE3_Msk;
     g_state = ST_SCAN;
+    if (hop_after_rsp) {
+        hop_after_rsp = false;
+        scan_idx++;
+        set_channel(ADV_CH[scan_idx]);
+        T->CC[1] = tnow() + SCAN_DWELL_US;
+    }
     R->SHORTS = RADIO_SHORTS_READY_START_Msk;
     R->PACKETPTR = (uint32_t)rxbuf;
     R->TASKS_RXEN = 1;
@@ -554,7 +589,7 @@ static void conn_leave(uint8_t cause) {
     stat[24] = cause;
     if (cause != CAUSE_USER) stat[9]++;
     if (g_off_req) enter_idle();
-    else scan_start();
+    else scan_start(cause != CAUSE_NOT_CUBE);
 }
 
 static inline uint16_t rd16(const uint8_t *p) { return p[0] | (p[1] << 8); }
@@ -1116,8 +1151,12 @@ static void stack_init() {
     g_inited = true;
 }
 
+// API call counters (debugStat 32/33): tell a user disconnect apart from a link drop
+static uint32_t n_connect_calls, n_disconnect_calls;
+
 //%
 void startConnect() {
+    n_connect_calls++;
     if (!g_inited) stack_init();
     if (g_off_req && g_state != ST_OFF) {
         g_reconnect = true;         // restart as soon as the disconnect has finished
@@ -1139,6 +1178,7 @@ void setNameFilter(String name) {
 
 //%
 void disconnect() {
+    n_disconnect_calls++;
     if (!g_inited || g_state == ST_OFF) return;
     g_reconnect = false;
     g_off_req = true;
@@ -1171,7 +1211,10 @@ int debugStat(int i) {
     // 30 current connection interval (ms), 31 current supervision timeout (ms)
     if (i == 30) return conn_interval * 5 / 4;
     if (i == 31) return conn_timeout * 10;
-    if (i < 1 || i > 29) return 0;
+    // 32 connect() calls, 33 disconnect() calls
+    if (i == 32) return n_connect_calls;
+    if (i == 33) return n_disconnect_calls;
+    if (i < 1 || i > 39) return 0;
     return (int)stat[i];
 }
 
