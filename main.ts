@@ -141,6 +141,17 @@ namespace circuitCubes {
     }
 
     /**
+     * The Bluetooth name of the connected cube, eg: "Tenka4130". Empty when not connected.
+     * Handy for showing which cube you are connected to.
+     */
+    //% blockId=circuitcubes_cubename block="Circuit Cube name"
+    //% weight=89
+    export function cubeName(): string {
+        if (!nativeIsConnected()) return "";
+        return isSim() ? "Tenka0000" : hwDebugName(2);
+    }
+
+    /**
      * Wait until a Circuit Cube is connected.
      * @param timeoutMs give up after this many milliseconds, 0 waits forever, eg: 0
      */

@@ -20,6 +20,7 @@ circuitCubes.stopAll()
 | --- | --- |
 | `connect to Circuit Cube` | Starts scanning for a device named `Tenka` or `Circuit Cube`, connects, discovers the Nordic UART write characteristic. Reconnects automatically after a dropped link. |
 | `Circuit Cube is connected` | `true` once linked **and** the write characteristic was found. |
+| `Circuit Cube name` | Text: the connected cube's Bluetooth name (e.g. `Tenka4130`), empty when not connected. Use it with `show string`. |
 | `wait until Circuit Cube is connected (max N ms)` | Pauses the program until connected; `0` (default) waits forever. |
 | `on Circuit Cube connected` / `on Circuit Cube disconnected` | Events fired whenever the link comes up or goes down (including automatic reconnects and drops). One handler each; polled every 50 ms. |
 | `disconnect Circuit Cube` | Closes the link (LL terminate) and stops scanning/auto-reconnect until `connect` is called again. |
