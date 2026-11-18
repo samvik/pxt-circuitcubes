@@ -21,6 +21,7 @@ circuitCubes.stopAll()
 | `connect to Circuit Cube` | Starts scanning for a device named `Tenka` or `Circuit Cube`, connects, discovers the Nordic UART write characteristic. Reconnects automatically after a dropped link. |
 | `Circuit Cube is connected` | `true` once linked **and** the write characteristic was found. |
 | `wait until Circuit Cube is connected (max N ms)` | Pauses the program until connected; `0` (default) waits forever. |
+| `on Circuit Cube connected` / `on Circuit Cube disconnected` | Events fired whenever the link comes up or goes down (including automatic reconnects and drops). One handler each; polled every 50 ms. |
 | `disconnect Circuit Cube` | Closes the link (LL terminate) and stops scanning/auto-reconnect until `connect` is called again. |
 | `set motor A/B/C to speed n` | Clamps to -255..255, sends `[+/-]NNN[a/b/c]`. Ignored while not connected. |
 | `run motor A/B/C at speed n for N ms` | Runs the motor, waits, then stops it. |
@@ -34,6 +35,61 @@ basic.forever(function () {
     if (circuitCubes.isConnected()) {
         circuitCubes.setMotor(CubePort.A, 200)
     }
+})
+```
+
+## Robot blocks
+
+For a tank-style robot (one motor per track) there is a **Robot** sub-tab under *Circuit Cubes*
+(`circuitCubes.robot`, in `robot.ts`). Speeds are **percent**, -100..100, converted to the cube's
+-255..255. Steering works by varying the speed of the two tracks.
+
+```blocks
+circuitCubes.robot.setMotors(CubePort.A, CubePort.B)
+circuitCubes.robot.steer(30, 50)
+circuitCubes.robot.stop()
+```
+
+| Block | What it does |
+| --- | --- |
+| `robot left motor A right motor B` | Chooses which cube ports drive the left and right track (default A and B). Port C stays free for other uses. |
+| `robot reverse left/right motor on/off` | Reverses one track. Use it when a motor is mounted mirrored and the robot spins instead of driving straight. |
+| `robot drive left L% right R%` | Sets each track's speed independently. |
+| `robot drive forward/backward at S%` | Both tracks at the same speed. |
+| `robot steer D at S%` | Drives in an arc. `D` is -100 (left) to 100 (right): 0 is straight, ±100 stops the inner track. A negative speed reverses. The inner track runs at `S × (100 − |D|) / 100`. |
+| `robot turn left/right at S%` | Pivots on the spot: one track forward, the other backward. |
+| `robot stop` | Stops both tracks. |
+| `robot drive … for N ms`, `robot turn … for N ms`, `robot steer … for N ms` | Timed versions; they wait, then stop the robot. |
+| `robot left speed` / `robot right speed` | The current speed of each track in percent (the logical value, before any reversal). |
+
+Example: steer with the micro:bit's tilt (forward/back = speed, left/right = steering). If a
+direction is the wrong way round, flip the sign of the matching `input.rotation` term.
+
+```ts
+circuitCubes.connect()
+circuitCubes.waitUntilConnected()
+circuitCubes.robot.setMotors(CubePort.A, CubePort.B)
+
+const DEADZONE = 10   // degrees ignored, so a flat board stands still
+const MAX_TILT = 40   // degrees giving full speed / full steering
+
+function tiltToPercent(angle: number): number {
+    if (Math.abs(angle) < DEADZONE) return 0
+    const sign = angle < 0 ? -1 : 1
+    return sign * Math.min(100, (Math.abs(angle) - DEADZONE) * 100 / (MAX_TILT - DEADZONE))
+}
+
+basic.forever(function () {
+    if (circuitCubes.isConnected()) {
+        const speed = tiltToPercent(-input.rotation(Rotation.Pitch))
+        const steer = tiltToPercent(input.rotation(Rotation.Roll))
+        if (speed == 0 && steer != 0) {
+            circuitCubes.robot.turn(steer < 0 ? TurnDirection.Left : TurnDirection.Right, Math.abs(steer))
+        } else {
+            circuitCubes.robot.steer(steer, speed)
+        }
+    }
+    basic.pause(50)   // each update sends two BLE writes; raise this if the link drops
 })
 ```
 
