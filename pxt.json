@@ -9,6 +9,7 @@
     "files": [
         "README.md",
         "main.ts",
+        "robot.ts",
         "shims.d.ts",
         "circuitcubes.cpp"
     ],
