@@ -155,6 +155,49 @@ namespace circuitCubes {
         }
     }
 
+    // ---- connection events ---------------------------------------------------
+    let onConnectedHandler: () => void = null;
+    let onDisconnectedHandler: () => void = null;
+    let watcherStarted = false;
+
+    // Polls the link state and fires the handlers on every change, so the events
+    // also fire for automatic reconnects and for drops.
+    function startWatcher(): void {
+        if (watcherStarted) return;
+        watcherStarted = true;
+        control.inBackground(function () {
+            let last = nativeIsConnected();
+            while (true) {
+                basic.pause(50);
+                const now = nativeIsConnected();
+                if (now == last) continue;
+                last = now;
+                const h = now ? onConnectedHandler : onDisconnectedHandler;
+                if (h) control.inBackground(h);
+            }
+        });
+    }
+
+    /**
+     * Run code when a Circuit Cube connects (also after an automatic reconnect).
+     */
+    //% blockId=circuitcubes_onconnected block="on Circuit Cube connected"
+    //% weight=94
+    export function onConnected(handler: () => void): void {
+        onConnectedHandler = handler;
+        startWatcher();
+    }
+
+    /**
+     * Run code when the Circuit Cube connection is lost or closed.
+     */
+    //% blockId=circuitcubes_ondisconnected block="on Circuit Cube disconnected"
+    //% weight=93
+    export function onDisconnected(handler: () => void): void {
+        onDisconnectedHandler = handler;
+        startWatcher();
+    }
+
     /**
      * Close the connection to the cube and stop scanning.
      * Call "connect to Circuit Cube" to connect again.
